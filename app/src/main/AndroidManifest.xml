@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Permissions -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- Camera is required -->
+    <uses-feature android:name="android.hardware.camera" android:required="true" />
+
+    <!-- ARCore: mark as optional so non-ARCore devices can still install.
+         We check at runtime and fall back to reference-object sizing. -->
+    <uses-feature android:name="android.hardware.camera.ar" android:required="false" />
+
+    <!-- ARCore required declaration (Google Play filters) -->
+    <meta-data
+        android:name="com.google.ar.core"
+        android:value="optional" />
+
+    <application
+        android:name=".KaloriesApp"
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="Kalories"
+        android:theme="@style/Theme.Kalories"
+        android:usesCleartextTraffic="true">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:screenOrientation="portrait">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+    </application>
+
+</manifest>

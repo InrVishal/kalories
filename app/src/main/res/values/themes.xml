@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.Kalories" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:statusBarColor">#FF1B1B2F</item>
+        <item name="android:navigationBarColor">#FF1B1B2F</item>
+        <item name="android:windowBackground">#FF1B1B2F</item>
+    </style>
+</resources>

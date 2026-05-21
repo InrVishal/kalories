@@ -1,0 +1,35 @@
+# Android builds and Gradle files
+.gradle/
+build/
+app/build/
+local.properties
+*.apk
+.idea/
+*.iml
+captures/
+.DS_Store
+
+# Python environment and caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.venv/
+.env
+backend/.env
+backend/__pycache__/
+backend/app/__pycache__/
+backend/app/core/__pycache__/
+backend/app/routers/__pycache__/
+backend/app/services/__pycache__/
+
+# Scratch scripts and test logs
+backend/scratch/
+backend/test_food.png
+backend/test_food.jpg
+*.log
