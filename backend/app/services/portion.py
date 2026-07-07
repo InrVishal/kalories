@@ -3,7 +3,7 @@ import logging
 
 logger = logging.getLogger("kalories.portion")
 
-def estimate_portion_weight(depth_bytes: bytes, meta: dict, food_name: str) -> float:
+def estimate_portion_weight(depth_bytes: bytes, meta: dict, food_name: str, estimated_density: float = None) -> float:
     """
     Parses a raw Depth16 map (uint16 in mm) and estimates weight in grams.
     Formula:
@@ -32,6 +32,11 @@ def estimate_portion_weight(depth_bytes: bytes, meta: dict, food_name: str) -> f
         if k in food_name.lower():
             density = v
             break
+            
+    if estimated_density is not None:
+        # Use LLM-estimated density if provided, clamped between 0.1 and 2.0 for safety
+        density = max(0.1, min(2.0, estimated_density))
+        logger.info(f"Using model-estimated density: {density} g/cm3 (raw predicted: {estimated_density})")
             
     if not depth_bytes:
         # Fallback if no depth map is provided

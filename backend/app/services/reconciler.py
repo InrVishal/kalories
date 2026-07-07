@@ -20,11 +20,21 @@ def clean_food_name(name: str) -> str:
             return standard_name
     return name.title()
 
+def merge(runs):
+    # If ANY model flagged NOT_FOOD, block the scan
+    for run in runs:
+        if isinstance(run, dict):
+            if run.get('error'):
+                raise ValueError(f"NOT_FOOD: {run.get('detected_as', 'unknown')}")
+        elif hasattr(run, 'error') and run.error:
+            raise ValueError(f"NOT_FOOD: {run.detected_as}")
+
 def reconcile_results(model_outputs: dict, depth_weight_g: float = None) -> list:
     """
     Groups outputs from multiple models, aggregates confidence, averages portion weights,
     and applies depth check if available.
     """
+    merge(model_outputs.values())
     logger.info("Reconciling outputs from models...")
     food_groups = {}
     
