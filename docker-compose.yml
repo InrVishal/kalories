@@ -1,0 +1,60 @@
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:latest
+    container_name: kalories-db
+    volumes:
+      - mongo-data:/data/db
+    networks:
+      - kalories-network
+
+  redis:
+    image: redis:alpine
+    container_name: kalories-cache
+    networks:
+      - kalories-network
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: kalories-backend
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8000
+      - ENVIRONMENT=production
+      - MONGODB_URL=mongodb://mongodb:27017/kalories
+      - REDIS_URL=redis://redis:6379/0
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - HF_API_KEY=${HF_API_KEY}
+      - USDA_API_KEY=${USDA_API_KEY}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - GEMMA_MODEL_NAME=${GEMMA_MODEL_NAME}
+    depends_on:
+      - mongodb
+      - redis
+    networks:
+      - kalories-network
+
+  nginx:
+    build:
+      context: ./nginx
+      dockerfile: Dockerfile
+    container_name: kalories-proxy
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - backend
+    networks:
+      - kalories-network
+
+volumes:
+  mongo-data:
+
+networks:
+  kalories-network:
+    driver: bridge

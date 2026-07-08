@@ -316,6 +316,10 @@ private fun ResultBottomSheet(result: ScanResult, onRescan: () -> Unit) {
                         items(result.items) { item -> FoodItemRow(item) }
                     }
 
+                    result.libidoAnalysis?.let { libido ->
+                        LibidoAnalysisCard(libido)
+                    }
+
                     Spacer(Modifier.height(20.dp))
 
                     // Rescan button
@@ -328,6 +332,116 @@ private fun ResultBottomSheet(result: ScanResult, onRescan: () -> Unit) {
                     }
 
                     Spacer(Modifier.height(8.dp))
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun LibidoAnalysisCard(libido: com.kalories.data.LibidoAnalysis) {
+    val directionColor = when (libido.impactDirection.lowercase()) {
+        "boost" -> Color(0xFF1D9E75)
+        "decrease" -> Color(0xFFD85A30)
+        else -> Color(0xFFEF9F27)
+    }
+    
+    val directionBg = directionColor.copy(alpha = 0.12f)
+
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 12.dp),
+        shape = RoundedCornerShape(12.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
+        )
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Metabolic & Libido Impact",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(20.dp))
+                        .background(directionBg)
+                        .padding(horizontal = 10.dp, vertical = 4.dp)
+                ) {
+                    Text(
+                        text = libido.impactDirection.uppercase(),
+                        color = directionColor,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        letterSpacing = 1.sp
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                // Score indicator
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(
+                        text = "${libido.impactPercent}%",
+                        fontSize = 24.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        color = directionColor
+                    )
+                    Text(
+                        text = "Impact Score",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+
+                Spacer(Modifier.width(16.dp))
+                Divider(
+                    modifier = Modifier
+                        .height(36.dp)
+                        .width(1.dp),
+                    color = MaterialTheme.colorScheme.outlineVariant
+                )
+                Spacer(Modifier.width(16.dp))
+
+                // Key factors
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Key Physiological Factors",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        libido.keyFactors.take(3).forEach { factor ->
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(MaterialTheme.colorScheme.surfaceVariant)
+                                    .padding(horizontal = 8.dp, vertical = 3.dp)
+                            ) {
+                                Text(
+                                    text = factor,
+                                    fontSize = 10.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    fontWeight = FontWeight.Medium
+                                )
+                            }
+                        }
+                    }
                 }
             }
         }

@@ -16,6 +16,14 @@ data class ScanResponse(
     @SerialName("total_macros") val totalMacros: MacrosResponse,
     @SerialName("depth_mm")  val depthMm: Int? = null,
     val model: String = "ensemble",
+    @SerialName("libido_analysis") val libidoAnalysis: LibidoAnalysisResponse? = null,
+)
+
+@Serializable
+data class LibidoAnalysisResponse(
+    @SerialName("impact_percent") val impactPercent: Int,
+    @SerialName("impact_direction") val impactDirection: String,
+    @SerialName("key_factors") val keyFactors: List<String>,
 )
 
 @Serializable
@@ -45,6 +53,13 @@ data class ScanResult(
     val totalKcal: Float,
     val depthMm: Int?,
     val model: String,
+    val libidoAnalysis: LibidoAnalysis? = null,
+)
+
+data class LibidoAnalysis(
+    val impactPercent: Int,
+    val impactDirection: String,
+    val keyFactors: List<String>,
 )
 
 data class FoodItem(
@@ -79,6 +94,13 @@ fun ScanResponse.toDomain() = ScanResult(
     totalKcal = totalKcal,
     depthMm   = depthMm,
     model     = model,
+    libidoAnalysis = libidoAnalysis?.toDomain(),
+)
+
+fun LibidoAnalysisResponse.toDomain() = LibidoAnalysis(
+    impactPercent = impactPercent,
+    impactDirection = impactDirection,
+    keyFactors = keyFactors,
 )
 
 fun FoodItemResponse.toDomain() = FoodItem(

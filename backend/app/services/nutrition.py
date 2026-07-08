@@ -1,5 +1,8 @@
 import httpx
 import logging
+import redis.asyncio as aioredis
+import json
+import urllib.parse
 from app.core.config import settings
 
 logger = logging.getLogger("kalories.nutrition")
@@ -28,75 +31,126 @@ NUTRITION_MOCK_DB = {
     "biryani": {"kcal": 150.0, "protein": 7.0, "carbs": 22.0, "fat": 4.0, "fiber": 1.5}
 }
 
+redis_client = None
+
+async def init_redis():
+    global redis_client
+    try:
+        pool = aioredis.ConnectionPool.from_url(
+            settings.REDIS_URL,
+            decode_responses=True,
+            socket_connect_timeout=0.2,
+            socket_timeout=0.2
+        )
+        redis_client = aioredis.Redis(connection_pool=pool)
+        await redis_client.ping()
+        logger.info("✅ Redis async client connected successfully!")
+    except Exception as e:
+        logger.warning(f"⚠️ Redis connection failed: {e}. Caching will be disabled.")
+        redis_client = None
+
+async def close_redis():
+    global redis_client
+    if redis_client is not None:
+        try:
+            await redis_client.close()
+            logger.info("Redis connection closed.")
+        except Exception as e:
+            logger.error(f"Error closing Redis connection: {e}")
+        redis_client = None
+
 async def lookup_nutrition(food_name: str) -> dict:
     """
     Looks up nutrition information (per 100g) for a food name from USDA FoodData Central.
+    Utilizes Redis to cache lookup results (expires in 24 hours).
     Falls back to a local nutrition database if the API key is not present or if the request fails.
     """
     food_key = food_name.lower().strip()
     
-    # Try finding exact match or substring match in local database first
+    # 1. Try fetching from Redis cache first
+    if redis_client is not None:
+        try:
+            cached_data = await redis_client.get(f"nutrition:{food_key}")
+            if cached_data:
+                logger.info(f"⚡ Redis cache hit for nutrition of '{food_name}'")
+                return json.loads(cached_data)
+        except Exception as ce:
+            logger.warning(f"Failed to fetch from Redis cache: {ce}")
+
+    # 2. Local fallback database lookup if Redis missed or failed
     local_match = None
     for k, v in NUTRITION_MOCK_DB.items():
         if k in food_key or food_key in k:
             local_match = v
             break
             
-    # Default fallback
     fallback_data = local_match or {"kcal": 100.0, "protein": 5.0, "carbs": 15.0, "fat": 2.0, "fiber": 1.0}
     
+    # 3. USDA API Query
     api_key = settings.USDA_API_KEY
     if not api_key:
         logger.info(f"No USDA API key. Using local lookup for '{food_name}'.")
-        return fallback_data
-        
-    try:
-        url = f"https://api.nal.usda.gov/fdc/v1/foods/search?api_key={api_key}&query={food_name}&pageSize=1"
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.get(url)
-            if response.status_code == 200:
-                data = response.json()
-                foods = data.get("foods", [])
-                if foods:
-                    food_item = foods[0]
-                    nutrients = food_item.get("foodNutrients", [])
-                    
-                    kcal = 0.0
-                    protein = 0.0
-                    carbs = 0.0
-                    fat = 0.0
-                    fiber = 0.0
-                    
-                    for n in nutrients:
-                        name = n.get("nutrientName", "").lower()
-                        value = float(n.get("value", 0.0))
+        result_data = fallback_data
+    else:
+        try:
+            safe_food_name = urllib.parse.quote(food_name)
+            url = f"https://api.nal.usda.gov/fdc/v1/foods/search?api_key={api_key}&query={safe_food_name}&pageSize=1"
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(url)
+                if response.status_code == 200:
+                    data = response.json()
+                    foods = data.get("foods", [])
+                    if foods:
+                        food_item = foods[0]
+                        nutrients = food_item.get("foodNutrients", [])
                         
-                        if "energy" in name or "kcal" in name:
-                            # Check unit to make sure it is in kcal
-                            unit = n.get("unitName", "").lower()
-                            if unit == "kcal" or "kcal" in name:
-                                kcal = value
-                        elif "protein" in name:
-                            protein = value
-                        elif "carbohydrate" in name:
-                            carbs = value
-                        elif "lipid" in name or "fat" in name:
-                            if "saturated" not in name:
-                                fat = value
-                        elif "fiber" in name:
-                            fiber = value
+                        kcal = 0.0
+                        protein = 0.0
+                        carbs = 0.0
+                        fat = 0.0
+                        fiber = 0.0
+                        
+                        for n in nutrients:
+                            name = n.get("nutrientName", "").lower()
+                            value = float(n.get("value", 0.0))
                             
-                    logger.info(f"USDA API match for '{food_name}': kcal={kcal}")
-                    return {
-                        "kcal": kcal if kcal > 0 else fallback_data["kcal"],
-                        "protein": protein,
-                        "carbs": carbs,
-                        "fat": fat,
-                        "fiber": fiber
-                    }
+                            if "energy" in name or "kcal" in name:
+                                unit = n.get("unitName", "").lower()
+                                if unit == "kcal" or "kcal" in name:
+                                    kcal = value
+                            elif "protein" in name:
+                                protein = value
+                            elif "carbohydrate" in name:
+                                carbs = value
+                            elif "lipid" in name or "fat" in name:
+                                if "saturated" not in name:
+                                    fat = value
+                            elif "fiber" in name:
+                                fiber = value
+                                
+                        logger.info(f"USDA API match for '{food_name}': kcal={kcal}")
+                        result_data = {
+                            "kcal": kcal if kcal > 0 else fallback_data["kcal"],
+                            "protein": protein,
+                            "carbs": carbs,
+                            "fat": fat,
+                            "fiber": fiber
+                        }
+                    else:
+                        logger.warning(f"USDA search returned empty for '{food_name}'.")
+                        result_data = fallback_data
+                else:
+                    logger.warning(f"USDA search failed for '{food_name}'. Status={response.status_code}")
+                    result_data = fallback_data
+        except Exception as e:
+            logger.error(f"Error querying USDA FDC for '{food_name}': {e}")
+            result_data = fallback_data
+
+    # 4. Save result to Redis cache (24 hours expiration)
+    if redis_client is not None:
+        try:
+            await redis_client.setex(f"nutrition:{food_key}", 86400, json.dumps(result_data))
+        except Exception as ce:
+            logger.warning(f"Failed to write to Redis cache: {ce}")
             
-            logger.warning(f"USDA search failed or empty for '{food_name}'. Status={response.status_code}")
-            return fallback_data
-    except Exception as e:
-        logger.error(f"Error querying USDA FDC for '{food_name}': {e}")
-        return fallback_data
+    return result_data

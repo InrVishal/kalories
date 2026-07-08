@@ -2,9 +2,62 @@ import asyncio
 import logging
 import json
 import base64
+import httpx
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 from app.core.config import settings
 
 logger = logging.getLogger("kalories.orchestrator")
+
+# Global circuit breakers to fail-fast on permanent API key failures
+_GEMINI_API_CIRCUIT_BROKEN = False
+_HF_API_CIRCUIT_BROKEN = False
+
+def is_transient_error(exception):
+    """Filter to skip retries on permanent failures like invalid keys or permission denial (400, 401, 403)."""
+    err_str = str(exception).lower()
+    # Permanent errors indicating invalid key, suspended project, or unauthorized domain
+    if any(pattern in err_str for pattern in ["permission", "suspend", "unauthorized", "invalid", "403", "401"]):
+        logger.warning(f"Detected permanent error. Bypassing retries. Error: {exception}")
+        return False
+    return True
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=4),
+    retry=retry_if_exception(is_transient_error),
+    reraise=True
+)
+async def _execute_with_retry(api_func, *args, **kwargs):
+    """Executes a function or coroutine with tenacity retry logic (3 attempts, exp backoff)."""
+    if asyncio.iscoroutinefunction(api_func):
+        return await api_func(*args, **kwargs)
+    else:
+        return await asyncio.to_thread(api_func, *args, **kwargs)
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=4),
+    retry=retry_if_exception(is_transient_error),
+    reraise=True
+)
+async def _httpx_post_with_retry(client: httpx.AsyncClient, url: str, **kwargs) -> httpx.Response:
+    """Sends httpx POST request and retries on failure or server errors."""
+    response = await client.post(url, **kwargs)
+    if response.status_code in [401, 403]:
+        # Raise HTTPStatusError so is_transient_error filter can detect it and fail fast
+        raise httpx.HTTPStatusError(
+            message=f"Permanent Client Auth Error: {response.status_code}",
+            request=response.request,
+            response=response
+        )
+    if response.status_code in [500, 502, 503, 504]:
+        raise httpx.HTTPStatusError(
+            message=f"Temporary Server Error: {response.status_code}",
+            request=response.request,
+            response=response
+        )
+    return response
+
 
 # ── Prompt for all vision models ──────────────────────────────────────────────
 FOOD_IDENTIFY_PROMPT = """You are a food recognition system with a critical safety filter.
@@ -245,9 +298,13 @@ def generate_dynamic_mock(image_bytes: bytes, filename: str = "") -> dict:
 
 async def run_gemini_vision(image_bytes: bytes, filename: str = "") -> dict:
     """Call Gemini 2.5 Flash with the food image for analysis."""
-    if not settings.GEMINI_API_KEY:
-        logger.info("Gemini API key missing. Returning mock response.")
-        await asyncio.sleep(0.3)
+    global _GEMINI_API_CIRCUIT_BROKEN
+    if not settings.GEMINI_API_KEY or _GEMINI_API_CIRCUIT_BROKEN:
+        if _GEMINI_API_CIRCUIT_BROKEN:
+            logger.info("Gemini API circuit broken. Bypassing and using dynamic mock.")
+        else:
+            logger.info("Gemini API key missing. Returning mock response.")
+        await asyncio.sleep(0.1)
         return generate_dynamic_mock(image_bytes, filename)
 
     try:
@@ -263,7 +320,7 @@ async def run_gemini_vision(image_bytes: bytes, filename: str = "") -> dict:
         }
 
         logger.info("Calling Gemini 2.5 Flash vision API...")
-        response = await asyncio.to_thread(
+        response = await _execute_with_retry(
             model.generate_content,
             [FOOD_ANALYSIS_PROMPT, image_part]
         )
@@ -307,6 +364,10 @@ async def run_gemini_vision(image_bytes: bytes, filename: str = "") -> dict:
         return generate_dynamic_mock(image_bytes, filename)
     except Exception as e:
         logger.error(f"Error calling Gemini: {e}")
+        err_msg = str(e).lower()
+        if any(pattern in err_msg for pattern in ["permission", "suspend", "unauthorized", "invalid", "403", "401"]):
+            _GEMINI_API_CIRCUIT_BROKEN = True
+            logger.error("🛑 Gemini API permanent error detected in Vision step. Circuit broken!")
         return generate_dynamic_mock(image_bytes, filename)
 
 
@@ -324,7 +385,8 @@ async def run_gpt4o_vision(image_bytes: bytes) -> dict:
         b64_image = base64.b64encode(image_bytes).decode("utf-8")
         logger.info("Calling GPT-4o vision API...")
 
-        response = await client.chat.completions.create(
+        response = await _execute_with_retry(
+            client.chat.completions.create,
             model="gpt-4o",
             messages=[{
                 "role": "user",
@@ -376,7 +438,8 @@ async def run_claude_vision(image_bytes: bytes) -> dict:
         b64_image = base64.b64encode(image_bytes).decode("utf-8")
         logger.info("Calling Claude vision API...")
 
-        response = await client.messages.create(
+        response = await _execute_with_retry(
+            client.messages.create,
             model="claude-sonnet-4-20250514",
             max_tokens=1000,
             messages=[{
@@ -433,9 +496,15 @@ async def check_ollama_model(model_name: str) -> str:
 
 _hf_processor = None
 _hf_model = None
+_hf_model_failed = False
 
 def get_local_gemma_model():
-    global _hf_processor, _hf_model
+    global _hf_processor, _hf_model, _hf_model_failed
+    if settings.ENVIRONMENT == "production":
+        logger.warning("Local Gemma CPU inference is disabled in production environment.")
+        return None, None
+    if _hf_model_failed:
+        return None, None
     if _hf_model is not None:
         return _hf_processor, _hf_model
         
@@ -457,14 +526,15 @@ def get_local_gemma_model():
         return _hf_processor, _hf_model
     except Exception as e:
         logger.error(f"Error loading local Gemma model: {e}")
+        _hf_model_failed = True
         return None, None
 
 async def run_local_gemma_multimodal(image_bytes: bytes, prompt: str) -> str:
-    processor, model = get_local_gemma_model()
-    if not model:
-        raise RuntimeError("Local Gemma model not available")
-        
     def _run():
+        processor, model = get_local_gemma_model()
+        if not model:
+            raise RuntimeError("Local Gemma model not available")
+            
         from PIL import Image
         import io
         import torch
@@ -491,11 +561,11 @@ async def run_local_gemma_multimodal(image_bytes: bytes, prompt: str) -> str:
     return await asyncio.to_thread(_run)
 
 async def run_local_gemma_text(prompt: str) -> str:
-    processor, model = get_local_gemma_model()
-    if not model:
-        raise RuntimeError("Local Gemma model not available")
-        
     def _run():
+        processor, model = get_local_gemma_model()
+        if not model:
+            raise RuntimeError("Local Gemma model not available")
+            
         import torch
         try:
             messages = [
@@ -545,7 +615,7 @@ async def run_gemma4_hf_vision(image_bytes: bytes, prompt: str) -> str:
         "temperature": 0.1
     }
     async with httpx.AsyncClient(timeout=25.0) as client:
-        response = await client.post(url, json=payload, headers=headers)
+        response = await _httpx_post_with_retry(client, url, json=payload, headers=headers)
         if response.status_code == 200:
             return response.json()["choices"][0]["message"]["content"].strip()
         else:
@@ -572,7 +642,7 @@ async def run_gemma4_hf_text(prompt: str) -> str:
         "temperature": 0.1
     }
     async with httpx.AsyncClient(timeout=25.0) as client:
-        response = await client.post(url, json=payload, headers=headers)
+        response = await _httpx_post_with_retry(client, url, json=payload, headers=headers)
         if response.status_code == 200:
             return response.json()["choices"][0]["message"]["content"].strip()
         else:
@@ -687,7 +757,7 @@ async def run_hf_vision(image_bytes: bytes) -> dict:
         
         logger.info(f"Calling Hugging Face Inference API for {model_id}...")
         async with httpx.AsyncClient(timeout=25.0) as client:
-            response = await client.post(url, json=payload, headers=headers)
+            response = await _httpx_post_with_retry(client, url, json=payload, headers=headers)
             
             if response.status_code == 200:
                 result = response.json()
@@ -797,6 +867,7 @@ async def run_call_1_vision(image_bytes: bytes, filename: str = "") -> dict:
 
 async def run_call_2_nutrition(reconciled_items: list) -> dict:
     """LLM Call 2 (Text): Take Call 1 output and estimate Calories (Kalories) & Protein (Proties)."""
+    global _GEMINI_API_CIRCUIT_BROKEN, _HF_API_CIRCUIT_BROKEN
     cleaned_items = []
     for item in reconciled_items:
         cleaned_items.append({
@@ -842,7 +913,7 @@ async def run_call_2_nutrition(reconciled_items: list) -> dict:
         logger.warning(f"Call 2 local Gemma failed: {e}. Trying HF API...")
 
     # 2. Try Hugging Face Inference API
-    if settings.HF_API_KEY:
+    if settings.HF_API_KEY and not _HF_API_CIRCUIT_BROKEN:
         try:
             raw_text = await run_gemma4_hf_text(prompt)
             parsed = parse_json_response(raw_text)
@@ -851,20 +922,28 @@ async def run_call_2_nutrition(reconciled_items: list) -> dict:
                 return parsed
         except Exception as e:
             logger.warning(f"Call 2 HF API failed: {e}. Trying Gemini...")
+            err_msg = str(e).lower()
+            if any(pattern in err_msg for pattern in ["permission", "suspend", "unauthorized", "invalid", "403", "401"]):
+                _HF_API_CIRCUIT_BROKEN = True
+                logger.error("🛑 HF Inference API permanent error detected in Call 2. Circuit broken!")
 
     # 3. Try Gemini API
-    if settings.GEMINI_API_KEY:
+    if settings.GEMINI_API_KEY and not _GEMINI_API_CIRCUIT_BROKEN:
         try:
             import google.generativeai as genai
             genai.configure(api_key=settings.GEMINI_API_KEY)
             model = genai.GenerativeModel("gemini-1.5-flash")
-            response = await asyncio.to_thread(model.generate_content, prompt)
+            response = await _execute_with_retry(model.generate_content, prompt)
             parsed = parse_json_response(response.text)
             if parsed and "items" in parsed:
                 logger.info("Call 2 (Nutrition) succeeded using Gemini API.")
                 return parsed
         except Exception as e:
             logger.warning(f"Call 2 Gemini API failed: {e}. Trying Ollama...")
+            err_msg = str(e).lower()
+            if any(pattern in err_msg for pattern in ["permission", "suspend", "unauthorized", "invalid", "403", "401"]):
+                _GEMINI_API_CIRCUIT_BROKEN = True
+                logger.error("🛑 Gemini API permanent error detected in Call 2. Circuit broken!")
 
     # 4. Try local Ollama
     try:
@@ -914,6 +993,7 @@ async def run_call_2_nutrition(reconciled_items: list) -> dict:
 
 async def run_call_3_libido(nutrition_data: dict) -> dict:
     """LLM Call 3 (Text): Take nutrition estimation and compute Libido Score (Libio Score)."""
+    global _GEMINI_API_CIRCUIT_BROKEN, _HF_API_CIRCUIT_BROKEN
     prompt = """You are an expert health and libido coach specializing in testosterone and hormone optimization.
     Given the following meal items and their estimated nutritional content:
     {nutrition_json}
@@ -947,7 +1027,7 @@ async def run_call_3_libido(nutrition_data: dict) -> dict:
         logger.warning(f"Call 3 local Gemma failed: {e}. Trying HF API...")
 
     # 2. Try Hugging Face Inference API
-    if settings.HF_API_KEY:
+    if settings.HF_API_KEY and not _HF_API_CIRCUIT_BROKEN:
         try:
             raw_text = await run_gemma4_hf_text(prompt)
             parsed = parse_json_response(raw_text)
@@ -956,20 +1036,28 @@ async def run_call_3_libido(nutrition_data: dict) -> dict:
                 return parsed
         except Exception as e:
             logger.warning(f"Call 3 HF API failed: {e}. Trying Gemini...")
+            err_msg = str(e).lower()
+            if any(pattern in err_msg for pattern in ["permission", "suspend", "unauthorized", "invalid", "403", "401"]):
+                _HF_API_CIRCUIT_BROKEN = True
+                logger.error("🛑 HF Inference API permanent error detected in Call 3. Circuit broken!")
 
     # 3. Try Gemini API
-    if settings.GEMINI_API_KEY:
+    if settings.GEMINI_API_KEY and not _GEMINI_API_CIRCUIT_BROKEN:
         try:
             import google.generativeai as genai
             genai.configure(api_key=settings.GEMINI_API_KEY)
             model = genai.GenerativeModel("gemini-1.5-flash")
-            response = await asyncio.to_thread(model.generate_content, prompt)
+            response = await _execute_with_retry(model.generate_content, prompt)
             parsed = parse_json_response(response.text)
             if parsed and "libido_analysis" in parsed:
                 logger.info("Call 3 (Libido) succeeded using Gemini API.")
                 return parsed
         except Exception as e:
             logger.warning(f"Call 3 Gemini API failed: {e}. Trying Ollama...")
+            err_msg = str(e).lower()
+            if any(pattern in err_msg for pattern in ["permission", "suspend", "unauthorized", "invalid", "403", "401"]):
+                _GEMINI_API_CIRCUIT_BROKEN = True
+                logger.error("🛑 Gemini API permanent error detected in Call 3. Circuit broken!")
 
     # 4. Try local Ollama
     try:
@@ -1062,7 +1150,7 @@ async def run_ollama_text(prompt: str) -> str:
             }
             logger.info(f"Calling local Ollama text model {text_model}...")
             async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(url, json=payload)
+                response = await _httpx_post_with_retry(client, url, json=payload)
                 if response.status_code == 200:
                     result = response.json()
                     return result.get("response", "").strip()
@@ -1085,6 +1173,7 @@ async def run_nutrition_and_analysis_llm(reconciled_items: list) -> dict:
 
 async def run_coach_chat_llm(message: str) -> dict:
     """Generate coach response using LLM."""
+    global _GEMINI_API_CIRCUIT_BROKEN, _HF_API_CIRCUIT_BROKEN
     # Baseline checks for greetings, appetite, and general health keywords
     ml = message.lower().strip()
     is_greeting = any(word in ml for word in ["hi", "hello", "hey", "greetings", "yo", "howdy", "sup"])
@@ -1157,7 +1246,7 @@ async def run_coach_chat_llm(message: str) -> dict:
         logger.warning(f"Coach Chat local Gemma failed: {e}. Trying HF API...")
 
     # 2. Try Hugging Face Inference API
-    if settings.HF_API_KEY:
+    if settings.HF_API_KEY and not _HF_API_CIRCUIT_BROKEN:
         try:
             raw_text = await run_gemma4_hf_text(prompt)
             parsed = parse_json_response(raw_text)
@@ -1166,20 +1255,28 @@ async def run_coach_chat_llm(message: str) -> dict:
                 return parsed
         except Exception as e:
             logger.warning(f"Coach Chat HF API failed: {e}. Trying Gemini...")
+            err_msg = str(e).lower()
+            if any(pattern in err_msg for pattern in ["permission", "suspend", "unauthorized", "invalid", "403", "401"]):
+                _HF_API_CIRCUIT_BROKEN = True
+                logger.error("🛑 HF Inference API permanent error detected in Coach Chat. Circuit broken!")
 
     # 3. Try Gemini API
-    if settings.GEMINI_API_KEY:
+    if settings.GEMINI_API_KEY and not _GEMINI_API_CIRCUIT_BROKEN:
         try:
             import google.generativeai as genai
             genai.configure(api_key=settings.GEMINI_API_KEY)
             model = genai.GenerativeModel("gemini-1.5-flash")
-            response = await asyncio.to_thread(model.generate_content, prompt)
+            response = await _execute_with_retry(model.generate_content, prompt)
             parsed = parse_json_response(response.text)
             if parsed and "reply" in parsed:
                 logger.info("Coach Chat succeeded using Gemini API.")
                 return parsed
         except Exception as e:
             logger.error(f"Error calling Gemini for Coach Chat: {e}. Attempting Ollama fallback...")
+            err_msg = str(e).lower()
+            if any(pattern in err_msg for pattern in ["permission", "suspend", "unauthorized", "invalid", "403", "401"]):
+                _GEMINI_API_CIRCUIT_BROKEN = True
+                logger.error("🛑 Gemini API permanent error detected in Coach Chat. Circuit broken!")
 
     # 4. Try Ollama local text generation
     try:
