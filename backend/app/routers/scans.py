@@ -368,6 +368,46 @@ async def get_scan_status(
 
     raise HTTPException(status_code=500, detail="Invalid scan status.")
 
+@router.get("")
+async def get_user_scans(
+    current_user: dict = Depends(get_current_user),
+    limit: int = 10
+):
+    """
+    Retrieve history of completed food scans for the authenticated user.
+    """
+    try:
+        username = current_user["username"]
+        if db is not None:
+            cursor = db.scans.find(
+                {"user_id": username, "status": "complete"}
+            ).sort("created_at", -1).limit(limit)
+            scans = await cursor.to_list(length=limit)
+            result = []
+            for scan in scans:
+                result.append({
+                    "scan_id": scan.get("_id"),
+                    "total_kcal": scan.get("total_kcal", 0.0),
+                    "libido_analysis": scan.get("libido_analysis", {}),
+                    "created_at": scan.get("created_at", datetime.utcnow()).isoformat()
+                })
+            result.reverse()
+            return result
+        else:
+            user_scans = []
+            for scan_id, scan in MOCK_SCANS_DB.items():
+                if scan.get("user_id") == username and scan.get("status") == "complete":
+                    user_scans.append({
+                        "scan_id": scan_id,
+                        "total_kcal": scan.get("total_kcal", 0.0),
+                        "libido_analysis": scan.get("libido_analysis", {}),
+                        "created_at": datetime.utcnow().isoformat()
+                    })
+            return user_scans[-limit:]
+    except Exception as e:
+        logger.error(f"Error fetching user scans: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 class CoachMessage(BaseModel):
     message: str
 

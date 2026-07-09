@@ -1306,12 +1306,12 @@
       <div class="card">
         <div class="card-title" style="justify-content: space-between; align-items: center;">
           <span>📈 Weekly Progress</span>
-          <div class="libido-score-pill">Libido: 82</div>
+          <div class="libido-score-pill" id="weeklyLibidoBadge">Libido: --</div>
         </div>
         <div class="card-subtitle">Hormonal & energy score over last 7 days</div>
 
         <div class="chart-container">
-          <svg viewBox="0 0 400 180" class="chart-svg">
+          <svg viewBox="0 0 400 180" class="chart-svg" id="libidoChartSvg">
             <defs>
               <linearGradient id="chart-glow" x1="0" y1="0" x2="0" y2="1">
                 <stop offset="0%" stop-color="#ff3b3f" stop-opacity="0.4"/>
@@ -1678,10 +1678,134 @@
     document.querySelectorAll('.screen-panel').forEach(panel => panel.classList.remove('active'));
     document.getElementById(`panel-${tabId}`).classList.add('active');
 
+    // Load progress data if progress tab clicked
+    if (tabId === 'progress') {
+      loadProgressData();
+    }
+
     // If 3D render needs to resize/update
     if (tabId === 'scanner' && depthMode === '3D') {
       setTimeout(() => onWindowResize(), 100);
     }
+  }
+
+  async function loadProgressData() {
+    try {
+      const resp = await fetch(`${API_HOST}/scans`, {
+        method: 'GET',
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      if (!resp.ok) throw new Error('Failed to fetch scans history');
+      const scans = await resp.json();
+      
+      // Calculate latest libido score to display in the header pill
+      if (scans.length > 0) {
+        const latestScan = scans[scans.length - 1];
+        const latestScore = latestScan.libido_analysis?.impact_percent || 0;
+        document.getElementById('weeklyLibidoBadge').textContent = `Libido: ${latestScore}`;
+      } else {
+        document.getElementById('weeklyLibidoBadge').textContent = `Libido: --`;
+      }
+      
+      drawLibidoChart(scans);
+    } catch (err) {
+      console.error(err);
+      showToast('⚠️ Could not load progress chart data');
+    }
+  }
+
+  function drawLibidoChart(scans) {
+    const svg = document.getElementById('libidoChartSvg');
+    if (!svg) return;
+    
+    const defsHTML = `
+      <defs>
+        <linearGradient id="chart-glow" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stop-color="#ff3b3f" stop-opacity="0.4"/>
+          <stop offset="100%" stop-color="#ff3b3f" stop-opacity="0.0"/>
+        </linearGradient>
+        <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+          <feGaussianBlur stdDeviation="5" result="blur" />
+          <feMerge>
+            <feMergeNode in="blur"/>
+            <feMergeNode in="SourceGraphic"/>
+          </feMerge>
+        </filter>
+      </defs>
+    `;
+    
+    if (!scans || scans.length === 0) {
+      svg.innerHTML = defsHTML + `
+        <text x="200" y="90" fill="var(--muted)" font-size="13" font-family="inherit" text-anchor="middle">
+          No scan data yet. Scan some meals to build your chart!
+        </text>
+      `;
+      return;
+    }
+    
+    let dataPoints = scans.map(s => {
+      let score = s.libido_analysis?.impact_percent || 0;
+      if (score < 0) score = 0;
+      
+      let label = "Meal";
+      if (s.created_at) {
+        const d = new Date(s.created_at);
+        label = d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+      }
+      return { score, label };
+    });
+    
+    if (dataPoints.length === 1) {
+      dataPoints = [
+        { score: dataPoints[0].score, label: "" },
+        { score: dataPoints[0].score, label: dataPoints[0].label }
+      ];
+    }
+    
+    const N = dataPoints.length;
+    const paddingLeft = 40;
+    const paddingRight = 40;
+    const width = 400;
+    const step = (width - paddingLeft - paddingRight) / (N - 1);
+    
+    let pathDLine = "";
+    let pathDFill = "";
+    let circlesHTML = "";
+    let labelsHTML = "";
+    
+    dataPoints.forEach((pt, i) => {
+      const x = paddingLeft + i * step;
+      const y = 140 - (pt.score / 100) * 110; 
+      
+      if (i === 0) {
+        pathDLine = \`M \${x} \${y}\`;
+        pathDFill = \`M \${x} 140 L \${x} \${y}\`;
+      } else {
+        pathDLine += \` L \${x} \${y}\`;
+        pathDFill += \` L \${x} \${y}\`;
+      }
+      
+      if (i === N - 1) {
+        pathDFill += \` L \${x} 140 Z\`;
+      }
+      
+      circlesHTML += \`
+        <circle cx="\${x}" cy="\${y}" r="5" fill="#fff" stroke="#ff3b3f" stroke-width="2.5"/>
+      \`;
+      
+      if (pt.label) {
+        labelsHTML += \`
+          <text x="\${x}" y="160" fill="#71717a" font-size="9" font-family="inherit" text-anchor="middle">\${pt.label}</text>
+        \`;
+      }
+    });
+    
+    svg.innerHTML = defsHTML + \`
+      <path d="\${pathDFill}" fill="url(#chart-glow)"/>
+      <path d="\${pathDLine}" fill="none" stroke="#ff3b3f" stroke-width="4" filter="url(#glow)"/>
+      \${circlesHTML}
+      \${labelsHTML}
+    \`;
   }
 
   // ── Habits Checkbox Toggle ──
